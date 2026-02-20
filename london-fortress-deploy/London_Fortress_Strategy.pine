@@ -1,0 +1,603 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © London Fortress Strategy - GBP/USD Specialist
+
+//@version=5
+strategy("London Fortress [GBP/USD]", overlay=true, max_labels_count=500,
+     default_qty_type=strategy.fixed, default_qty_value=5,
+     initial_capital=95, currency=currency.GBP,
+     pyramiding=5, calc_on_every_tick=false,
+     process_orders_on_close=false,
+     commission_type=strategy.commission.cash_per_order, commission_value=0.0)
+
+// ═══════════════════════════════════════════════════════════════════════
+//  INPUT SETTINGS
+// ═══════════════════════════════════════════════════════════════════════
+
+// --- Higher Timeframe Trend Filters ---
+grpHTF = "══════ Higher Timeframe Filters ══════"
+dailyEmaLen     = input.int(50,    "Daily EMA Length",          minval=1,               group=grpHTF, tooltip="50-period EMA on the Daily chart. Acts as the institutional trend filter.")
+h4AtrPeriod     = input.int(20,    "H4 Supertrend ATR Period",  minval=1,               group=grpHTF, tooltip="ATR period for the 4-Hour Supertrend.")
+h4Factor        = input.float(3.5, "H4 Supertrend Factor",      minval=0.1, step=0.1,  group=grpHTF, tooltip="Multiplier for the 4-Hour Supertrend.")
+h4AdxLen        = input.int(14,    "H4 ADX Length",              minval=1,               group=grpHTF, tooltip="ADX period on the 4-Hour chart.")
+h4AdxThreshold  = input.float(20,  "H4 ADX Threshold",          minval=5, step=1,       group=grpHTF, tooltip="Minimum ADX value to confirm trending market. Below this = choppy market, no trades.")
+
+// --- Entry Timeframe Settings ---
+grpEntry = "══════ Entry Settings (H1) ══════"
+fastLen         = input.int(9,     "Fast EMA Length",            minval=1,               group=grpEntry, tooltip="Fast EMA for momentum confirmation.")
+slowLen         = input.int(21,    "Slow EMA Length",            minval=1,               group=grpEntry, tooltip="Slow EMA for momentum confirmation.")
+rsiLen          = input.int(14,    "RSI Length",                 minval=1,               group=grpEntry, tooltip="RSI period for pullback entries.")
+rsiBuyZone      = input.float(40,  "RSI Buy Zone (Pullback)",   minval=10, maxval=50,   group=grpEntry, tooltip="RSI below this level during an uptrend = pullback buy opportunity.")
+rsiSellZone     = input.float(60,  "RSI Sell Zone (Pullback)",  minval=50, maxval=90,   group=grpEntry, tooltip="RSI above this level during a downtrend = pullback sell opportunity.")
+
+// --- London Breakout Settings ---
+grpLB = "══════ London Breakout ══════"
+asianStartHour  = input.int(0,     "Asian Session Start (UTC)", minval=0, maxval=23,    group=grpLB, tooltip="Start hour of the Asian session range (UTC).")
+asianEndHour    = input.int(8,     "Asian Session End / London Open (UTC)", minval=0, maxval=23, group=grpLB, tooltip="End of Asian session = London Open (UTC).")
+breakoutBuffer  = input.float(5,   "Breakout Buffer (pips)",    minval=0, step=1,       group=grpLB, tooltip="Extra pips beyond the Asian range to confirm a breakout.")
+
+// --- Session Filter ---
+grpSession = "══════ Session Filter ══════"
+londonOpenHour  = input.int(8,     "Trading Start Hour (UTC)",  minval=0, maxval=23,    group=grpSession, tooltip="8 AM UK = London Open.")
+tradingEndHour  = input.int(20,    "Trading End Hour (UTC)",    minval=0, maxval=23,    group=grpSession, tooltip="8 PM UK = Close all positions.")
+usOpenHour      = input.int(13,    "US Open Hour (UTC)",        minval=0, maxval=23,    group=grpSession, tooltip="1 PM UK = US Market Open. Second scan for entries.")
+
+// --- Risk Management ---
+grpRM = "══════ Risk Management ══════"
+riskRewardRatio = input.float(2.5, "Risk/Reward Ratio",         minval=1.0, step=0.1,   group=grpRM, tooltip="Take Profit distance as a multiple of Stop Loss distance.")
+maxStackTrades  = input.int(5,     "Max Stacked Trades",        minval=1, maxval=10,    group=grpRM, tooltip="Maximum number of trades to stack at each entry point.")
+bevenPips       = input.float(10,  "Breakeven Trigger (pips)",  minval=1, step=1,       group=grpRM, tooltip="Move SL to breakeven + this many pips when price moves this far in profit.")
+slTrail25       = input.bool(true, "Trail SL to 25% of TP",                             group=grpRM, tooltip="Move SL to 25% of the way to TP.")
+slTrail50       = input.bool(true, "Trail SL to 50% of TP",                             group=grpRM, tooltip="Move SL to 50% of the way to TP.")
+slTrail75       = input.bool(true, "Trail SL to 75% of TP",                             group=grpRM, tooltip="Move SL to 75% of the way to TP.")
+closeAtEOD      = input.bool(true, "Close All at End of Day",                           group=grpRM, tooltip="Close all positions at Trading End Hour.")
+
+// --- Visual Settings ---
+grpVis = "══════ Visual Settings ══════"
+showBuySell     = input.bool(true,  "Show Buy/Sell Labels",                              group=grpVis)
+showCloud       = input.bool(true,  "Show EMA Cloud",                                    group=grpVis)
+showSTCloud     = input.bool(true,  "Show Supertrend Cloud",                             group=grpVis)
+showAsianRange  = input.bool(true,  "Show Asian Session Range",                          group=grpVis)
+colorCandles    = input.bool(true,  "Color Candles by Trend",                            group=grpVis)
+showDashboard   = input.bool(true,  "Show Info Dashboard",                               group=grpVis)
+
+// --- Alert Settings ---
+grpAlert = "══════ Alert / Webhook Settings ══════"
+enableAlerts    = input.bool(true,  "Enable Alert Conditions",                           group=grpAlert)
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  MULTI-TIMEFRAME CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════
+
+// --- Daily 50 EMA (Institutional Trend Filter) ---
+dailyEma = request.security(syminfo.tickerid, "D", ta.ema(close, dailyEmaLen), lookahead=barmerge.lookahead_off)
+dailyBullish = close > dailyEma
+dailyBearish = close < dailyEma
+
+// --- 4-Hour Supertrend ---
+[h4STValue, h4STDir] = request.security(syminfo.tickerid, "240", ta.supertrend(h4Factor, h4AtrPeriod), lookahead=barmerge.lookahead_off)
+h4STBullish = h4STDir < 0
+h4STBearish = h4STDir > 0
+h4STFlipBull = h4STDir < 0 and h4STDir[1] > 0
+h4STFlipBear = h4STDir > 0 and h4STDir[1] < 0
+
+// --- 4-Hour ADX (Trend Strength) ---
+// Custom ADX calculation for MTF
+h4_adx_val = request.security(syminfo.tickerid, "240", ta.rma(math.abs(ta.change(ta.ema(close, h4AdxLen)) - ta.change(ta.ema(close, h4AdxLen))), h4AdxLen), lookahead=barmerge.lookahead_off)
+
+// Simplified ADX using DI+ and DI- approach
+h4_tr = request.security(syminfo.tickerid, "240", ta.tr(true), lookahead=barmerge.lookahead_off)
+h4_up = request.security(syminfo.tickerid, "240", ta.change(high), lookahead=barmerge.lookahead_off)
+h4_down = request.security(syminfo.tickerid, "240", -ta.change(low), lookahead=barmerge.lookahead_off)
+
+f_rma(_src, _len) =>
+    alpha = 1.0 / _len
+    var float _result = na
+    _result := na(_result) ? _src : alpha * _src + (1 - alpha) * nz(_result)
+    _result
+
+// Request H4 ADX components
+h4_plus_dm  = request.security(syminfo.tickerid, "240", ta.rma(math.max(ta.change(high), 0) * (ta.change(high) > -ta.change(low) ? 1 : 0), h4AdxLen), lookahead=barmerge.lookahead_off)
+h4_minus_dm = request.security(syminfo.tickerid, "240", ta.rma(math.max(-ta.change(low), 0) * (-ta.change(low) > ta.change(high) ? 1 : 0), h4AdxLen), lookahead=barmerge.lookahead_off)
+h4_atr_adx  = request.security(syminfo.tickerid, "240", ta.rma(ta.tr(true), h4AdxLen), lookahead=barmerge.lookahead_off)
+
+h4_plus_di  = h4_atr_adx != 0 ? 100 * h4_plus_dm / h4_atr_adx : 0
+h4_minus_di = h4_atr_adx != 0 ? 100 * h4_minus_dm / h4_atr_adx : 0
+h4_dx       = (h4_plus_di + h4_minus_di) != 0 ? 100 * math.abs(h4_plus_di - h4_minus_di) / (h4_plus_di + h4_minus_di) : 0
+
+// Use a simple smoothed DX as ADX proxy
+var float h4_adx = 0.0
+h4_adx := na(h4_adx[1]) ? h4_dx : (h4_adx[1] * (h4AdxLen - 1) + h4_dx) / h4AdxLen
+
+h4TrendStrong = h4_adx > h4AdxThreshold
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CURRENT TIMEFRAME CALCULATIONS (H1)
+// ═══════════════════════════════════════════════════════════════════════
+
+// --- H1 Supertrend (for visual and SL reference) ---
+[stValue, stDir] = ta.supertrend(h4Factor, h4AtrPeriod)
+stLine = barstate.isfirst ? na : stValue
+stBullish = stDir < 0
+stBearish = stDir > 0
+stFlipBull = stDir < 0 and stDir[1] > 0
+stFlipBear = stDir > 0 and stDir[1] < 0
+
+// --- EMAs ---
+fastEMA  = ta.ema(close, fastLen)
+slowEMA  = ta.ema(close, slowLen)
+
+emaBullish   = fastEMA > slowEMA
+emaBearish   = fastEMA < slowEMA
+emaCrossUp   = ta.crossover(fastEMA, slowEMA)
+emaCrossDown = ta.crossunder(fastEMA, slowEMA)
+
+// --- RSI ---
+rsiValue = ta.rsi(close, rsiLen)
+rsiBullPullback = rsiValue < rsiBuyZone    // RSI dipped into buy zone (pullback in uptrend)
+rsiBearPullback = rsiValue > rsiSellZone   // RSI spiked into sell zone (pullback in downtrend)
+
+// RSI divergence detection (simplified)
+rsiRising  = rsiValue > rsiValue[1] and rsiValue[1] < rsiValue[2]  // RSI turning up
+rsiFalling = rsiValue < rsiValue[1] and rsiValue[1] > rsiValue[2]  // RSI turning down
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  LONDON BREAKOUT RANGE (Asian Session High/Low)
+// ═══════════════════════════════════════════════════════════════════════
+
+var float asianHigh = na
+var float asianLow  = na
+var float asianHighFinal = na
+var float asianLowFinal  = na
+var bool  asianRangeSet  = false
+
+currentHour = hour(time, "UTC")
+
+// Track Asian session range
+isAsianSession  = currentHour >= asianStartHour and currentHour < asianEndHour
+isLondonSession = currentHour >= londonOpenHour and currentHour < tradingEndHour
+isUSSession     = currentHour >= usOpenHour and currentHour < tradingEndHour
+
+// Reset at start of Asian session
+if currentHour == asianStartHour and currentHour[1] != asianStartHour
+    asianHigh := high
+    asianLow  := low
+    asianRangeSet := false
+
+// Build the range during Asian session
+if isAsianSession
+    asianHigh := math.max(nz(asianHigh, high), high)
+    asianLow  := math.min(nz(asianLow, low), low)
+
+// Lock the range at London open
+if currentHour == asianEndHour and currentHour[1] != asianEndHour
+    asianHighFinal := asianHigh
+    asianLowFinal  := asianLow
+    asianRangeSet  := true
+
+// Breakout detection (with buffer in pips)
+pipSize = syminfo.mintick * 10  // 1 pip for forex
+bufferValue = breakoutBuffer * pipSize
+
+breakoutLong  = asianRangeSet and close > (asianHighFinal + bufferValue) and close[1] <= (asianHighFinal + bufferValue)
+breakoutShort = asianRangeSet and close < (asianLowFinal - bufferValue) and close[1] >= (asianLowFinal - bufferValue)
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  SESSION TIME CHECK
+// ═══════════════════════════════════════════════════════════════════════
+
+isTradingHours = currentHour >= londonOpenHour and currentHour < tradingEndHour
+isEndOfDay     = currentHour >= tradingEndHour and currentHour[1] < tradingEndHour
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  SIGNAL STRENGTH CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Signal strength: 0 = none, 1 = light, 2 = moderate, 3 = strong
+var int buyStrength  = 0
+var int sellStrength = 0
+
+// --- BUY SIGNAL LOGIC ---
+// All higher timeframe filters must align
+buyHTFAligned = dailyBullish and h4STBullish and h4TrendStrong
+
+// Entry triggers (from strongest to weakest)
+buyBreakout     = buyHTFAligned and breakoutLong and emaBullish and isTradingHours
+buySTFlip       = buyHTFAligned and stFlipBull and emaBullish and isTradingHours
+buyPullback     = buyHTFAligned and rsiBullPullback and rsiRising and emaBullish and close > slowEMA and isTradingHours
+buyEMACross     = buyHTFAligned and emaCrossUp and stBullish and isTradingHours
+buyTrendCont    = buyHTFAligned and stBullish and emaBullish and close > fastEMA and isTradingHours and (currentHour == londonOpenHour or currentHour == usOpenHour)
+
+// Assign strength
+buyStrength := buyBreakout ? 3 : buySTFlip ? 3 : buyPullback ? 2 : buyEMACross ? 2 : buyTrendCont ? 1 : 0
+
+// --- SELL SIGNAL LOGIC ---
+sellHTFAligned = dailyBearish and h4STBearish and h4TrendStrong
+
+sellBreakout    = sellHTFAligned and breakoutShort and emaBearish and isTradingHours
+sellSTFlip      = sellHTFAligned and stFlipBear and emaBearish and isTradingHours
+sellPullback    = sellHTFAligned and rsiBearPullback and rsiFalling and emaBearish and close < slowEMA and isTradingHours
+sellEMACross    = sellHTFAligned and emaCrossDown and stBearish and isTradingHours
+sellTrendCont   = sellHTFAligned and stBearish and emaBearish and close < fastEMA and isTradingHours and (currentHour == londonOpenHour or currentHour == usOpenHour)
+
+sellStrength := sellBreakout ? 3 : sellSTFlip ? 3 : sellPullback ? 2 : sellEMACross ? 2 : sellTrendCont ? 1 : 0
+
+// Final signals
+bool buySignal  = buyStrength >= 1
+bool sellSignal = sellStrength >= 1
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  TRADE EXECUTION WITH STACKING (5x 0.01 lots)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Calculate SL and TP levels
+atrValue = ta.atr(h4AtrPeriod)
+initialSL_long  = stValue  // Supertrend as initial SL
+initialSL_short = stValue
+
+// For buy: SL below entry, TP above entry
+buySLDist  = math.abs(close - initialSL_long)
+buyTPDist  = buySLDist * riskRewardRatio
+buyTP      = close + buyTPDist
+buySL      = initialSL_long
+
+// For sell: SL above entry, TP below entry
+sellSLDist = math.abs(initialSL_short - close)
+sellTPDist = sellSLDist * riskRewardRatio
+sellTP     = close - sellTPDist
+sellSL     = initialSL_short
+
+// --- Trade Stacking: Enter 5 trades per signal ---
+if buySignal and strategy.opentrades < maxStackTrades
+    numToOpen = maxStackTrades - strategy.opentrades
+    for i = 0 to numToOpen - 1
+        strategy.entry("BUY_" + str.tostring(i + 1), strategy.long, qty=1, comment="Stack " + str.tostring(i + 1) + " | Str:" + str.tostring(buyStrength))
+    // Set initial SL and TP for all buy trades
+    strategy.exit("TP/SL_BUY", from_entry="BUY_1", stop=buySL, limit=buyTP)
+    strategy.exit("TP/SL_BUY2", from_entry="BUY_2", stop=buySL, limit=buyTP)
+    strategy.exit("TP/SL_BUY3", from_entry="BUY_3", stop=buySL, limit=buyTP)
+    strategy.exit("TP/SL_BUY4", from_entry="BUY_4", stop=buySL, limit=buyTP)
+    strategy.exit("TP/SL_BUY5", from_entry="BUY_5", stop=buySL, limit=buyTP)
+
+if sellSignal and strategy.opentrades < maxStackTrades
+    numToOpen = maxStackTrades - strategy.opentrades
+    for i = 0 to numToOpen - 1
+        strategy.entry("SELL_" + str.tostring(i + 1), strategy.short, qty=1, comment="Stack " + str.tostring(i + 1) + " | Str:" + str.tostring(sellStrength))
+    strategy.exit("TP/SL_SELL", from_entry="SELL_1", stop=sellSL, limit=sellTP)
+    strategy.exit("TP/SL_SELL2", from_entry="SELL_2", stop=sellSL, limit=sellTP)
+    strategy.exit("TP/SL_SELL3", from_entry="SELL_3", stop=sellSL, limit=sellTP)
+    strategy.exit("TP/SL_SELL4", from_entry="SELL_4", stop=sellSL, limit=sellTP)
+    strategy.exit("TP/SL_SELL5", from_entry="SELL_5", stop=sellSL, limit=sellTP)
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PROGRESSIVE STOP LOSS PROTECTION
+// ═══════════════════════════════════════════════════════════════════════
+
+// Track entry price and manage SL progression for open trades
+var float entryPrice = na
+var float currentSL  = na
+var float currentTP  = na
+var int   tradeDir   = 0  // 1 = long, -1 = short
+var int   slStage    = 0  // 0=initial, 1=breakeven, 2=25%, 3=50%, 4=75%
+
+// Detect new trade entry
+if strategy.opentrades > 0 and strategy.opentrades[1] == 0
+    entryPrice := strategy.opentrades.entry_price(0)
+    tradeDir   := strategy.position_size > 0 ? 1 : -1
+    slStage    := 0
+    if tradeDir == 1
+        currentSL := entryPrice - buySLDist
+        currentTP := entryPrice + buyTPDist
+    else
+        currentSL := entryPrice + sellSLDist
+        currentTP := entryPrice - sellTPDist
+
+// Progressive SL management
+if strategy.opentrades > 0 and not na(entryPrice)
+    bevenValue = bevenPips * pipSize
+    tpDist = math.abs(currentTP - entryPrice)
+    
+    if tradeDir == 1  // Long positions
+        currentProfit = close - entryPrice
+        
+        // Stage 1: Move SL to breakeven + 10 pips
+        if slStage == 0 and currentProfit >= bevenValue
+            newSL = entryPrice + bevenValue
+            for i = 0 to strategy.opentrades - 1
+                strategy.exit("TP/SL_BUY" + (i == 0 ? "" : str.tostring(i + 1)), stop=newSL, limit=currentTP)
+            currentSL := newSL
+            slStage   := 1
+        
+        // Stage 2: Move SL to 25% toward TP
+        if slStage == 1 and slTrail25 and currentProfit >= tpDist * 0.25
+            newSL = entryPrice + tpDist * 0.25
+            for i = 0 to strategy.opentrades - 1
+                strategy.exit("TP/SL_BUY" + (i == 0 ? "" : str.tostring(i + 1)), stop=newSL, limit=currentTP)
+            currentSL := newSL
+            slStage   := 2
+        
+        // Stage 3: Move SL to 50% toward TP
+        if slStage == 2 and slTrail50 and currentProfit >= tpDist * 0.50
+            newSL = entryPrice + tpDist * 0.50
+            for i = 0 to strategy.opentrades - 1
+                strategy.exit("TP/SL_BUY" + (i == 0 ? "" : str.tostring(i + 1)), stop=newSL, limit=currentTP)
+            currentSL := newSL
+            slStage   := 3
+        
+        // Stage 4: Move SL to 75% toward TP
+        if slStage == 3 and slTrail75 and currentProfit >= tpDist * 0.75
+            newSL = entryPrice + tpDist * 0.75
+            for i = 0 to strategy.opentrades - 1
+                strategy.exit("TP/SL_BUY" + (i == 0 ? "" : str.tostring(i + 1)), stop=newSL, limit=currentTP)
+            currentSL := newSL
+            slStage   := 4
+    
+    else if tradeDir == -1  // Short positions
+        currentProfit = entryPrice - close
+        
+        // Stage 1: Move SL to breakeven - 10 pips (above entry for shorts)
+        if slStage == 0 and currentProfit >= bevenValue
+            newSL = entryPrice - bevenValue
+            for i = 0 to strategy.opentrades - 1
+                strategy.exit("TP/SL_SELL" + (i == 0 ? "" : str.tostring(i + 1)), stop=newSL, limit=currentTP)
+            currentSL := newSL
+            slStage   := 1
+        
+        // Stage 2: Move SL to 25% toward TP
+        if slStage == 1 and slTrail25 and currentProfit >= tpDist * 0.25
+            newSL = entryPrice - tpDist * 0.25
+            for i = 0 to strategy.opentrades - 1
+                strategy.exit("TP/SL_SELL" + (i == 0 ? "" : str.tostring(i + 1)), stop=newSL, limit=currentTP)
+            currentSL := newSL
+            slStage   := 2
+        
+        // Stage 3: Move SL to 50% toward TP
+        if slStage == 2 and slTrail50 and currentProfit >= tpDist * 0.50
+            newSL = entryPrice - tpDist * 0.50
+            for i = 0 to strategy.opentrades - 1
+                strategy.exit("TP/SL_SELL" + (i == 0 ? "" : str.tostring(i + 1)), stop=newSL, limit=currentTP)
+            currentSL := newSL
+            slStage   := 3
+        
+        // Stage 4: Move SL to 75% toward TP
+        if slStage == 3 and slTrail75 and currentProfit >= tpDist * 0.75
+            newSL = entryPrice - tpDist * 0.75
+            for i = 0 to strategy.opentrades - 1
+                strategy.exit("TP/SL_SELL" + (i == 0 ? "" : str.tostring(i + 1)), stop=newSL, limit=currentTP)
+            currentSL := newSL
+            slStage   := 4
+
+// Reset tracking when all trades close
+if strategy.opentrades == 0
+    entryPrice := na
+    currentSL  := na
+    currentTP  := na
+    tradeDir   := 0
+    slStage    := 0
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  END OF DAY CLOSE
+// ═══════════════════════════════════════════════════════════════════════
+
+if closeAtEOD and isEndOfDay and strategy.opentrades > 0
+    strategy.close_all(comment="EOD Close 8PM UK")
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  CLOSE ON OPPOSITE SIGNAL
+// ═══════════════════════════════════════════════════════════════════════
+
+// Close longs on strong sell signal
+if sellStrength >= 2 and strategy.position_size > 0
+    strategy.close_all(comment="Opposite Signal Close")
+
+// Close shorts on strong buy signal
+if buyStrength >= 2 and strategy.position_size < 0
+    strategy.close_all(comment="Opposite Signal Close")
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PLOTTING
+// ═══════════════════════════════════════════════════════════════════════
+
+// --- Daily EMA (from higher timeframe) ---
+plot(dailyEma, "Daily 50 EMA", color=color.new(#FFD700, 20), linewidth=3, style=plot.style_line)
+
+// --- H1 Supertrend Line ---
+upTrendPlot   = plot(stBullish ? stLine : na, "Supertrend Up",   color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+downTrendPlot = plot(stBearish ? stLine : na, "Supertrend Down", color=color.new(color.red, 0),   style=plot.style_linebr, linewidth=2)
+
+// --- Supertrend Cloud ---
+bodyMiddle = plot(barstate.isfirst ? na : (open + close) / 2, "Body Middle", display=display.none)
+fill(bodyMiddle, upTrendPlot,   showSTCloud ? color.new(color.green, 88) : na, fillgaps=false)
+fill(bodyMiddle, downTrendPlot, showSTCloud ? color.new(color.red, 88)   : na, fillgaps=false)
+
+// --- EMA Lines ---
+fastPlot  = plot(fastEMA,  "Fast EMA (9)",  color=color.new(#2196F3, 0), linewidth=1)
+slowPlot  = plot(slowEMA,  "Slow EMA (21)", color=color.new(#FF9800, 0), linewidth=1)
+
+// --- EMA Cloud ---
+emaCloudColor = emaBullish ? color.new(#2196F3, 88) : color.new(#FF9800, 88)
+fill(fastPlot, slowPlot, showCloud ? emaCloudColor : na, title="EMA Cloud")
+
+// --- Asian Session Range ---
+asianHighLine = plot(showAsianRange and asianRangeSet and isLondonSession ? asianHighFinal : na, "Asian High", color=color.new(#00BCD4, 40), style=plot.style_linebr, linewidth=1)
+asianLowLine  = plot(showAsianRange and asianRangeSet and isLondonSession ? asianLowFinal : na, "Asian Low",  color=color.new(#00BCD4, 40), style=plot.style_linebr, linewidth=1)
+fill(asianHighLine, asianLowLine, showAsianRange ? color.new(#00BCD4, 92) : na, title="Asian Range Fill")
+
+// --- Candle Coloring ---
+overallTrend = dailyBullish and h4STBullish and emaBullish ? 1 : dailyBearish and h4STBearish and emaBearish ? -1 : 0
+bullColor    = color.new(#26A69A, 0)
+bearColor    = color.new(#EF5350, 0)
+neutralColor = color.new(#787B86, 0)
+candleColor  = overallTrend == 1 ? bullColor : overallTrend == -1 ? bearColor : neutralColor
+barcolor(colorCandles ? candleColor : na, title="Trend Candle Color")
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  BUY / SELL LABELS
+// ═══════════════════════════════════════════════════════════════════════
+
+// Signal type labels
+buyLabelText  = buyBreakout ? "BUY\nBREAKOUT" : buySTFlip ? "BUY\nST FLIP" : buyPullback ? "BUY\nPULLBACK" : buyEMACross ? "BUY\nEMA CROSS" : buyTrendCont ? "BUY\nTREND" : ""
+sellLabelText = sellBreakout ? "SELL\nBREAKOUT" : sellSTFlip ? "SELL\nST FLIP" : sellPullback ? "SELL\nPULLBACK" : sellEMACross ? "SELL\nEMA CROSS" : sellTrendCont ? "SELL\nTREND" : ""
+
+// Color by strength
+buyLabelColor  = buyStrength == 3 ? color.new(#00C853, 0) : buyStrength == 2 ? color.new(#26A69A, 0) : color.new(#4CAF50, 50)
+sellLabelColor = sellStrength == 3 ? color.new(#FF1744, 0) : sellStrength == 2 ? color.new(#EF5350, 0) : color.new(#E57373, 50)
+
+if showBuySell and buySignal
+    label.new(bar_index, low, buyLabelText,
+         style=label.style_label_up,
+         color=buyLabelColor,
+         textcolor=color.white,
+         size=buyStrength == 3 ? size.normal : size.small)
+
+if showBuySell and sellSignal
+    label.new(bar_index, high, sellLabelText,
+         style=label.style_label_down,
+         color=sellLabelColor,
+         textcolor=color.white,
+         size=sellStrength == 3 ? size.normal : size.small)
+
+// --- SL Stage markers ---
+plotshape(slStage == 1 and slStage[1] == 0, "SL → Breakeven", shape.diamond, location.belowbar, color.new(#FFD700, 0), size=size.tiny)
+plotshape(slStage == 2 and slStage[1] == 1, "SL → 25%",       shape.diamond, location.belowbar, color.new(#FFA726, 0), size=size.tiny)
+plotshape(slStage == 3 and slStage[1] == 2, "SL → 50%",       shape.diamond, location.belowbar, color.new(#42A5F5, 0), size=size.tiny)
+plotshape(slStage == 4 and slStage[1] == 3, "SL → 75%",       shape.diamond, location.belowbar, color.new(#AB47BC, 0), size=size.tiny)
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  INFORMATION DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 2, 12, bgcolor=color.new(#1E1E1E, 5), border_width=1, border_color=color.new(#333333, 0))
+
+if barstate.islast and showDashboard
+    // Title
+    table.cell(dash, 0, 0, "LONDON FORTRESS", text_color=color.new(#FFD700, 0), text_size=size.small, text_halign=text.align_center, bgcolor=color.new(#1E1E1E, 0))
+    table.cell(dash, 1, 0, "GBP/USD",         text_color=color.new(#FFD700, 0), text_size=size.small, text_halign=text.align_center, bgcolor=color.new(#1E1E1E, 0))
+    
+    // Daily Trend
+    dTrendText  = dailyBullish ? "BULLISH ▲" : "BEARISH ▼"
+    dTrendColor = dailyBullish ? color.green : color.red
+    table.cell(dash, 0, 1, "Daily Trend",  text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 1, dTrendText,     text_color=dTrendColor, text_size=size.small, text_halign=text.align_center)
+    
+    // H4 Supertrend
+    h4STText  = h4STBullish ? "BULLISH ▲" : "BEARISH ▼"
+    h4STColor = h4STBullish ? color.green : color.red
+    table.cell(dash, 0, 2, "H4 Supertrend", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 2, h4STText,        text_color=h4STColor, text_size=size.small, text_halign=text.align_center)
+    
+    // H4 ADX
+    adxText  = h4TrendStrong ? "STRONG (" + str.tostring(h4_adx, "#.0") + ")" : "WEAK (" + str.tostring(h4_adx, "#.0") + ")"
+    adxColor = h4TrendStrong ? color.green : color.orange
+    table.cell(dash, 0, 3, "H4 ADX",       text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 3, adxText,         text_color=adxColor, text_size=size.small, text_halign=text.align_center)
+    
+    // H1 EMA Cross
+    emaText  = emaBullish ? "BULLISH ▲" : "BEARISH ▼"
+    emaColor = emaBullish ? color.green : color.red
+    table.cell(dash, 0, 4, "H1 EMA Cross", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 4, emaText,         text_color=emaColor, text_size=size.small, text_halign=text.align_center)
+    
+    // RSI
+    rsiText  = rsiValue > rsiSellZone ? "OVERBOUGHT" : rsiValue < rsiBuyZone ? "OVERSOLD" : "NEUTRAL"
+    rsiColor = rsiValue > rsiSellZone ? color.red : rsiValue < rsiBuyZone ? color.green : color.gray
+    table.cell(dash, 0, 5, "H1 RSI (" + str.tostring(rsiValue, "#.0") + ")", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 5, rsiText,    text_color=rsiColor, text_size=size.small, text_halign=text.align_center)
+    
+    // Session
+    sessionText  = isLondonSession ? (isUSSession ? "LONDON + US ●" : "LONDON ●") : "CLOSED ○"
+    sessionColor = isLondonSession ? color.green : color.red
+    table.cell(dash, 0, 6, "Session",    text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 6, sessionText,  text_color=sessionColor, text_size=size.small, text_halign=text.align_center)
+    
+    // Asian Range
+    rangeText = asianRangeSet ? str.tostring(asianHighFinal, "#.#####") + " / " + str.tostring(asianLowFinal, "#.#####") : "Building..."
+    table.cell(dash, 0, 7, "Asian Range", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 7, rangeText,     text_color=color.new(#00BCD4, 0), text_size=size.small, text_halign=text.align_center)
+    
+    // Open Trades
+    table.cell(dash, 0, 8, "Open Trades", text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 8, str.tostring(strategy.opentrades) + " / " + str.tostring(maxStackTrades), text_color=color.white, text_size=size.small, text_halign=text.align_center)
+    
+    // SL Stage
+    slStageText  = slStage == 0 ? "INITIAL" : slStage == 1 ? "BREAKEVEN +10p" : slStage == 2 ? "25% TO TP" : slStage == 3 ? "50% TO TP" : "75% TO TP"
+    slStageColor = slStage == 0 ? color.gray : slStage == 1 ? color.new(#FFD700, 0) : slStage == 2 ? color.new(#FFA726, 0) : slStage == 3 ? color.new(#42A5F5, 0) : color.new(#AB47BC, 0)
+    table.cell(dash, 0, 9, "SL Stage",   text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 9, slStageText,  text_color=slStageColor, text_size=size.small, text_halign=text.align_center)
+    
+    // Signal Strength
+    sigText  = buyStrength >= 1 ? "BUY (" + str.tostring(buyStrength) + "/3)" : sellStrength >= 1 ? "SELL (" + str.tostring(sellStrength) + "/3)" : "NO SIGNAL"
+    sigColor = buyStrength >= 1 ? color.green : sellStrength >= 1 ? color.red : color.gray
+    table.cell(dash, 0, 10, "Signal",    text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 10, sigText,     text_color=sigColor, text_size=size.normal, text_halign=text.align_center)
+    
+    // P&L
+    plText  = strategy.netprofit >= 0 ? "+" + str.tostring(strategy.netprofit, "#.##") + " GBP" : str.tostring(strategy.netprofit, "#.##") + " GBP"
+    plColor = strategy.netprofit >= 0 ? color.green : color.red
+    table.cell(dash, 0, 11, "Net P/L",   text_color=color.white, text_size=size.small, text_halign=text.align_left)
+    table.cell(dash, 1, 11, plText,      text_color=plColor, text_size=size.small, text_halign=text.align_center)
+
+
+// ═══════════════════════════════════════════════════════════════════════
+//  ALERT CONDITIONS (for Webhook / OANDA Bot)
+// ═══════════════════════════════════════════════════════════════════════
+
+// --- Strong Buy Alert (Breakout or ST Flip) ---
+alertcondition(buyStrength == 3, title="STRONG BUY Signal",
+     message='{"action":"BUY","pair":"GBP_USD","strength":3,"type":"breakout","price":"{{close}}","stack":5}')
+
+// --- Moderate Buy Alert (Pullback or EMA Cross) ---
+alertcondition(buyStrength == 2, title="MODERATE BUY Signal",
+     message='{"action":"BUY","pair":"GBP_USD","strength":2,"type":"pullback","price":"{{close}}","stack":5}')
+
+// --- Light Buy Alert (Trend Continuation) ---
+alertcondition(buyStrength == 1, title="LIGHT BUY Signal",
+     message='{"action":"BUY","pair":"GBP_USD","strength":1,"type":"trend","price":"{{close}}","stack":3}')
+
+// --- Strong Sell Alert ---
+alertcondition(sellStrength == 3, title="STRONG SELL Signal",
+     message='{"action":"SELL","pair":"GBP_USD","strength":3,"type":"breakout","price":"{{close}}","stack":5}')
+
+// --- Moderate Sell Alert ---
+alertcondition(sellStrength == 2, title="MODERATE SELL Signal",
+     message='{"action":"SELL","pair":"GBP_USD","strength":2,"type":"pullback","price":"{{close}}","stack":5}')
+
+// --- Light Sell Alert ---
+alertcondition(sellStrength == 1, title="LIGHT SELL Signal",
+     message='{"action":"SELL","pair":"GBP_USD","strength":1,"type":"trend","price":"{{close}}","stack":3}')
+
+// --- SL Stage Changes ---
+alertcondition(slStage == 1 and slStage[1] == 0, title="SL to Breakeven",
+     message='{"action":"MODIFY_SL","pair":"GBP_USD","stage":"breakeven"}')
+
+alertcondition(slStage == 2 and slStage[1] == 1, title="SL to 25pct",
+     message='{"action":"MODIFY_SL","pair":"GBP_USD","stage":"25pct"}')
+
+alertcondition(slStage == 3 and slStage[1] == 2, title="SL to 50pct",
+     message='{"action":"MODIFY_SL","pair":"GBP_USD","stage":"50pct"}')
+
+alertcondition(slStage == 4 and slStage[1] == 3, title="SL to 75pct",
+     message='{"action":"MODIFY_SL","pair":"GBP_USD","stage":"75pct"}')
+
+// --- End of Day Close ---
+alertcondition(closeAtEOD and isEndOfDay and strategy.opentrades > 0, title="EOD Close All",
+     message='{"action":"CLOSE_ALL","pair":"GBP_USD","reason":"end_of_day"}')
+
+// --- Any Buy Signal ---
+alertcondition(buySignal, title="ANY BUY Signal",
+     message='LONDON FORTRESS BUY on GBP_USD | Price: {{close}}')
+
+// --- Any Sell Signal ---
+alertcondition(sellSignal, title="ANY SELL Signal",
+     message='LONDON FORTRESS SELL on GBP_USD | Price: {{close}}')
