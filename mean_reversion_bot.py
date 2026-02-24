@@ -37,6 +37,7 @@ from telegram_notifier import (
     notify_bot_started,
     TELEGRAM_ENABLED
 )
+from trade_logger import log_trade_opened, log_trade_closed
 
 # ============================================================================
 # CONFIGURATION
@@ -340,9 +341,20 @@ class TradeManager:
             "opened_at": datetime.now(timezone.utc)
         }
     
-    def remove_position(self, instrument):
-        """Remove closed position."""
+    def remove_position(self, instrument, exit_price=None, pnl=None):
+        """Remove closed position and log to database."""
         if instrument in self.positions:
+            pos = self.positions[instrument]
+            # Log trade closure to database if we have the DB trade ID
+            if "db_trade_id" in pos and exit_price and pnl is not None:
+                try:
+                    log_trade_closed(
+                        trade_id=pos["db_trade_id"],
+                        exit_price=exit_price,
+                        pnl=pnl
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to log trade closure to database: {e}")
             del self.positions[instrument]
     
     def has_position(self, instrument):
@@ -515,6 +527,25 @@ def execute_trade(signal):
             signal["action"],
             signal["units"]
         )
+        
+        # Log trade to database
+        try:
+            db_trade_id = log_trade_opened(
+                bot="mean-reversion",
+                pair=instrument,
+                direction=signal["action"],
+                signal_type=f"RSI {signal['rsi']:.1f} + BB {signal['bb_position']}",
+                entry_price=entry_price,
+                units=signal["units"],
+                stop_loss=signal["sl"],
+                take_profit=signal["tp"],
+                metadata={"atr": signal["atr"], "rsi": signal["rsi"]}
+            )
+            # Store DB trade ID in position for later update
+            if db_trade_id:
+                trade_mgr.positions[instrument]["db_trade_id"] = db_trade_id
+        except Exception as e:
+            logger.error(f"Database logging failed: {e}")
         
         # Send Telegram notification
         if TELEGRAM_ENABLED:
