@@ -318,6 +318,11 @@ class TradeManager:
         self.consecutive_wins = 0
         self.consecutive_losses = 0
         self.position_size_multiplier = 1.0  # 1.0 = base size, 2.0 = double
+        
+        # Circuit breaker
+        self.circuit_breaker_active = False
+        self.circuit_breaker_until = None  # datetime when trading resumes
+        self.circuit_breaker_pause_hours = 4
     
     def update_starting_balance(self):
         """Update starting balance at beginning of day."""
@@ -423,10 +428,58 @@ class TradeManager:
                         notify_error(f"⚠️ Position size RESET after {self.consecutive_losses} consecutive losses")
                     except:
                         pass
+            
+            # Circuit breaker: pause trading after 5 consecutive losses
+            if self.consecutive_losses >= 5 and not self.circuit_breaker_active:
+                self.activate_circuit_breaker()
     
     def get_scaled_position_size(self, base_size):
         """Get position size with auto-scaling multiplier applied."""
         return int(base_size * self.position_size_multiplier)
+    
+    def activate_circuit_breaker(self):
+        """Activate circuit breaker to pause trading."""
+        self.circuit_breaker_active = True
+        self.circuit_breaker_until = datetime.now(timezone.utc) + timedelta(hours=self.circuit_breaker_pause_hours)
+        
+        resume_time = self.circuit_breaker_until.strftime("%Y-%m-%d %H:%M UTC")
+        logger.error(f"🛑 CIRCUIT BREAKER ACTIVATED: Trading paused for {self.circuit_breaker_pause_hours}h after {self.consecutive_losses} losses. Resume at {resume_time}")
+        
+        if TELEGRAM_ENABLED:
+            try:
+                from telegram_notifier import notify_error
+                notify_error(
+                    f"🛑 CIRCUIT BREAKER ACTIVATED\n\n"
+                    f"Trading paused for {self.circuit_breaker_pause_hours} hours after {self.consecutive_losses} consecutive losses.\n\n"
+                    f"Resume time: {resume_time}\n\n"
+                    f"This protects your capital during unfavorable market conditions."
+                )
+            except Exception as e:
+                logger.error(f"Failed to send circuit breaker notification: {e}")
+    
+    def check_circuit_breaker(self):
+        """Check if circuit breaker should be deactivated."""
+        if self.circuit_breaker_active and self.circuit_breaker_until:
+            now = datetime.now(timezone.utc)
+            if now >= self.circuit_breaker_until:
+                self.circuit_breaker_active = False
+                self.circuit_breaker_until = None
+                logger.info("✅ CIRCUIT BREAKER DEACTIVATED: Trading resumed")
+                
+                if TELEGRAM_ENABLED:
+                    try:
+                        from telegram_notifier import notify_error
+                        notify_error(
+                            f"✅ CIRCUIT BREAKER DEACTIVATED\n\n"
+                            f"Trading has automatically resumed after {self.circuit_breaker_pause_hours}h pause.\n\n"
+                            f"Consecutive loss counter reset. Good luck!"
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send resume notification: {e}")
+                
+                return False  # Not active
+            return True  # Still active
+        return False  # Not active
 
 
 trade_mgr = TradeManager()
@@ -741,6 +794,11 @@ def scan_all_instruments():
 
 def periodic_scan():
     """Run market scan every 15 minutes."""
+    # Check if circuit breaker should be deactivated
+    if trade_mgr.check_circuit_breaker():
+        logger.warning("🛑 Circuit breaker active - skipping scan")
+        return
+    
     scan_all_instruments()
 
 
