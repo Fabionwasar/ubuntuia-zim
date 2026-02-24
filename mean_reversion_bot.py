@@ -198,15 +198,29 @@ def get_open_trades(instrument=None):
     return []
 
 
+def round_price(price, instrument):
+    """Round price to appropriate precision for instrument.
+    JPY pairs: 3 decimals (e.g., 155.812)
+    Other pairs: 5 decimals (e.g., 1.17764)
+    """
+    if "JPY" in instrument:
+        return round(price, 3)
+    return round(price, 5)
+
+
 def place_market_order(instrument, units, sl_price, tp_price):
     """Place a market order with SL and TP."""
+    # Round prices to appropriate precision
+    sl_price = round_price(sl_price, instrument)
+    tp_price = round_price(tp_price, instrument)
+    
     order_data = {
         "order": {
             "type": "MARKET",
             "instrument": instrument,
             "units": str(units),
-            "stopLossOnFill": {"price": f"{sl_price:.5f}"},
-            "takeProfitOnFill": {"price": f"{tp_price:.5f}"}
+            "stopLossOnFill": {"price": str(sl_price)},
+            "takeProfitOnFill": {"price": str(tp_price)}
         }
     }
     
@@ -216,11 +230,15 @@ def place_market_order(instrument, units, sl_price, tp_price):
     return None
 
 
-def modify_trade_sl(trade_id, new_sl):
+def modify_trade_sl(trade_id, new_sl, instrument=None):
     """Modify stop loss for an existing trade."""
+    # Round price if instrument is provided
+    if instrument:
+        new_sl = round_price(new_sl, instrument)
+    
     data = {
         "stopLoss": {
-            "price": f"{new_sl:.5f}"
+            "price": str(new_sl) if instrument else f"{new_sl:.5f}"
         }
     }
     result = oanda_request(f"/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/orders", method="PUT", data=data)
@@ -720,7 +738,7 @@ def check_trailing_stops():
             # Step 1: Move to breakeven after 10 pips profit
             if not pos["breakeven_moved"] and profit_pips >= 10:
                 logger.info(f"{instrument}: Moving SL to breakeven (+10 pips profit reached)")
-                if modify_trade_sl(pos["trade_id"], entry):
+                if modify_trade_sl(pos["trade_id"], entry, instrument):
                     pos["sl"] = entry
                     pos["breakeven_moved"] = True
                     if TELEGRAM_ENABLED:
@@ -746,7 +764,7 @@ def check_trailing_stops():
                 
                 if should_update:
                     logger.info(f"{instrument}: Trailing SL to 50% of profit ({profit_pips:.1f} pips)")
-                    if modify_trade_sl(pos["trade_id"], new_sl):
+                    if modify_trade_sl(pos["trade_id"], new_sl, instrument):
                         pos["sl"] = new_sl
                         if TELEGRAM_ENABLED:
                             notify_sl_stage_change(instrument, f"trailing ({profit_pips:.1f} pips)", new_sl)
