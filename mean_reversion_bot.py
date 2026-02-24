@@ -60,14 +60,14 @@ OANDA_BASE_URL = "https://api-fxtrade.oanda.com"  # LIVE endpoint
 
 # Trading Configuration — SOFT LAUNCH (Conservative)
 INSTRUMENTS = ["EUR_USD", "GBP_USD"]  # Only 2 pairs for soft launch
-BASE_POSITION_SIZE = 500  # 0.005 lot = 500 units (50% smaller)
+BASE_POSITION_SIZE = 2000  # 0.02 lot = 2000 units (4x soft launch size)
 MAX_POSITIONS_PER_PAIR = 1
-MAX_TOTAL_POSITIONS = 2  # Max 2 positions total during soft launch
+MAX_TOTAL_POSITIONS = 3  # Max 3 positions total (1 per pair)
 
 # Strategy Parameters
 RSI_PERIOD = 14
-RSI_OVERSOLD = 30
-RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 50  # Widened from 30 to generate more signals
+RSI_OVERBOUGHT = 50  # Widened from 70 to generate more signals
 BB_PERIOD = 20
 BB_STD_DEV = 2.0
 ATR_PERIOD = 14
@@ -81,10 +81,13 @@ MAX_SPREAD_PIPS = {
     "USD_JPY": 2.0
 }
 
-# Session Times (UTC) — STRICT FILTERING FOR SOFT LAUNCH
+# Session Times (UTC) — 24/5 TRADING (No session filter)
 LONDON_NY_OVERLAP_START = 13  # 1 PM UTC
 LONDON_NY_OVERLAP_END = 16    # 4 PM UTC
-STRICT_SESSION_FILTER = True  # No trades outside session during soft launch
+STRICT_SESSION_FILTER = False  # Trade 24/5 for maximum opportunities
+
+# Momentum Filter — Only trade when market is moving
+MIN_ATR_MULTIPLIER = 0.5  # Only trade if ATR > 0.5x average ATR
 
 # Logging
 LOG_FILE = "/home/ubuntu/mean_reversion_bot.log"
@@ -364,6 +367,21 @@ class TradeManager:
     def get_position(self, instrument):
         """Get position details."""
         return self.positions.get(instrument)
+    
+    def sync_positions_with_oanda(self):
+        """Sync local position tracking with actual OANDA positions."""
+        logger.info("Syncing positions with OANDA...")
+        open_trades = get_open_trades()
+        oanda_instruments = {t["instrument"] for t in open_trades}
+        
+        # Remove positions that don't exist in OANDA
+        for instrument in list(self.positions.keys()):
+            if instrument not in oanda_instruments:
+                logger.warning(f"Removing phantom position for {instrument} (not in OANDA)")
+                del self.positions[instrument]
+        
+        logger.info(f"Position sync complete. Tracked: {len(self.positions)}, OANDA: {len(open_trades)}")
+        return len(self.positions)
 
 
 trade_mgr = TradeManager()
@@ -429,16 +447,18 @@ def analyze_instrument(instrument):
             logger.debug(f"{instrument}: Spread too wide ({pricing['spread']/pip_value:.1f} pips)")
             return None
         
-        # Check session filter (STRICT during soft launch)
-        if not is_high_volume_session():
-            if STRICT_SESSION_FILTER:
-                logger.debug(f"{instrument}: Outside trading session (strict mode)")
-                return None
-            # Allow trades outside session only if high volatility
-            avg_atr = sum([calculate_atr(candles[i:i+ATR_PERIOD+1], ATR_PERIOD) or 0 
-                          for i in range(len(candles)-30, len(candles)-ATR_PERIOD)]) / 20
-            if atr < avg_atr * 1.5:
-                logger.debug(f"{instrument}: Outside trading session and low volatility")
+        # Momentum Filter: Only trade when market is moving (ATR check)
+        # Calculate average ATR over last 20 periods
+        atr_values = []
+        for i in range(len(candles)-30, len(candles)-ATR_PERIOD):
+            atr_val = calculate_atr(candles[i:i+ATR_PERIOD+1], ATR_PERIOD)
+            if atr_val:
+                atr_values.append(atr_val)
+        
+        if atr_values:
+            avg_atr = sum(atr_values) / len(atr_values)
+            if atr < avg_atr * MIN_ATR_MULTIPLIER:
+                logger.debug(f"{instrument}: Low momentum (ATR {atr:.5f} < {avg_atr * MIN_ATR_MULTIPLIER:.5f})")
                 return None
         
         # Calculate position size
@@ -772,7 +792,7 @@ if __name__ == "__main__":
     logger.info("╔" + "═" * 68 + "╗")
     logger.info("║  MEAN-REVERSION BOT — RSI + BOLLINGER BANDS                        ║")
     logger.info("║  Strategy: Counter-trend mean-reversion with layered filtering     ║")
-    logger.info("║  Mode: LIVE SOFT LAUNCH (24-hour validation with mini positions)   ║")
+    logger.info("║  Mode: LIVE AGGRESSIVE (24/5 trading, widened RSI, 4x position size) ║")
     logger.info("╚" + "═" * 68 + "╝")
     logger.info(f"  Environment:    {OANDA_ENVIRONMENT.upper()}")
     logger.info(f"  Account:        {OANDA_ACCOUNT_ID}")
@@ -780,7 +800,7 @@ if __name__ == "__main__":
     logger.info(f"  Timeframe:      M15 (15-minute candles)")
     logger.info(f"  RSI:            Period={RSI_PERIOD}, Oversold<{RSI_OVERSOLD}, Overbought>{RSI_OVERBOUGHT}")
     logger.info(f"  Bollinger:      Period={BB_PERIOD}, StdDev={BB_STD_DEV}")
-    logger.info(f"  Session:        London/NY Overlap {LONDON_NY_OVERLAP_START}:00-{LONDON_NY_OVERLAP_END}:00 UTC")
+    logger.info(f"  Session:        24/5 Trading (No session filter)")
     logger.info(f"  Position Size:  {BASE_POSITION_SIZE} units (dynamic based on ATR)")
     logger.info("─" * 70)
     
@@ -789,6 +809,9 @@ if __name__ == "__main__":
     if account:
         logger.info(f"  ✓ OANDA CONNECTED | Balance: {account['balance']:.2f} {account['currency']}")
         trade_mgr.update_starting_balance()
+        
+        # Sync positions to fix phantom position bug
+        trade_mgr.sync_positions_with_oanda()
         
         # Send Telegram bot started notification
         if TELEGRAM_ENABLED:
