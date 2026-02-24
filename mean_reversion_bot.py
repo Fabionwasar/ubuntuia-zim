@@ -59,7 +59,7 @@ OANDA_ENVIRONMENT = "live"
 OANDA_BASE_URL = "https://api-fxtrade.oanda.com"  # LIVE endpoint
 
 # Trading Configuration — SOFT LAUNCH (Conservative)
-INSTRUMENTS = ["EUR_USD", "GBP_USD"]  # Only 2 pairs for soft launch
+INSTRUMENTS = ["EUR_USD", "GBP_USD", "USD_JPY"]  # 3 pairs for diversification
 BASE_POSITION_SIZE = 2000  # 0.02 lot = 2000 units (4x soft launch size)
 MAX_POSITIONS_PER_PAIR = 1
 MAX_TOTAL_POSITIONS = 3  # Max 3 positions total (1 per pair)
@@ -313,6 +313,11 @@ class TradeManager:
         self.daily_pnl = 0.0
         self.starting_balance = 0.0
         self.positions = {}  # {instrument: {trade_id, entry_price, sl, tp, direction}}
+        
+        # Auto-scaling tracking
+        self.consecutive_wins = 0
+        self.consecutive_losses = 0
+        self.position_size_multiplier = 1.0  # 1.0 = base size, 2.0 = double
     
     def update_starting_balance(self):
         """Update starting balance at beginning of day."""
@@ -358,6 +363,11 @@ class TradeManager:
                     )
                 except Exception as e:
                     logger.error(f"Failed to log trade closure to database: {e}")
+            
+            # Record trade result for auto-scaling
+            if pnl is not None:
+                self.record_trade_result(pnl)
+            
             del self.positions[instrument]
     
     def has_position(self, instrument):
@@ -382,6 +392,41 @@ class TradeManager:
         
         logger.info(f"Position sync complete. Tracked: {len(self.positions)}, OANDA: {len(open_trades)}")
         return len(self.positions)
+    
+    def record_trade_result(self, pnl):
+        """Record trade result and update auto-scaling multiplier."""
+        if pnl > 0:
+            self.consecutive_wins += 1
+            self.consecutive_losses = 0
+            
+            # Scale up after 20 consecutive wins
+            if self.consecutive_wins >= 20 and self.position_size_multiplier < 2.0:
+                self.position_size_multiplier = 2.0
+                logger.info(f"🚀 AUTO-SCALING UP: Position size doubled after {self.consecutive_wins} wins")
+                if TELEGRAM_ENABLED:
+                    try:
+                        from telegram_notifier import notify_error
+                        notify_error(f"🚀 Position size DOUBLED after {self.consecutive_wins} consecutive wins!")
+                    except:
+                        pass
+        else:
+            self.consecutive_losses += 1
+            self.consecutive_wins = 0
+            
+            # Scale down after 3 consecutive losses
+            if self.consecutive_losses >= 3 and self.position_size_multiplier > 1.0:
+                self.position_size_multiplier = 1.0
+                logger.warning(f"⚠️ AUTO-SCALING DOWN: Position size reset after {self.consecutive_losses} losses")
+                if TELEGRAM_ENABLED:
+                    try:
+                        from telegram_notifier import notify_error
+                        notify_error(f"⚠️ Position size RESET after {self.consecutive_losses} consecutive losses")
+                    except:
+                        pass
+    
+    def get_scaled_position_size(self, base_size):
+        """Get position size with auto-scaling multiplier applied."""
+        return int(base_size * self.position_size_multiplier)
 
 
 trade_mgr = TradeManager()
@@ -395,16 +440,20 @@ def is_high_volume_session():
 
 
 def calculate_position_size(instrument, atr):
-    """Calculate dynamic position size based on ATR volatility."""
+    """Calculate dynamic position size based on ATR volatility with auto-scaling."""
     pip_value = 0.0001 if "JPY" not in instrument else 0.01
     atr_pips = atr / pip_value
     
+    # Base size calculation based on volatility
     if atr_pips < 10:
-        return int(BASE_POSITION_SIZE * 1.5)  # 1500 units (lower volatility)
+        base_size = int(BASE_POSITION_SIZE * 1.5)  # Lower volatility
     elif atr_pips > 20:
-        return int(BASE_POSITION_SIZE * 0.5)  # 500 units (higher volatility)
+        base_size = int(BASE_POSITION_SIZE * 0.5)  # Higher volatility
     else:
-        return BASE_POSITION_SIZE  # 1000 units (normal)
+        base_size = BASE_POSITION_SIZE  # Normal volatility
+    
+    # Apply auto-scaling multiplier
+    return trade_mgr.get_scaled_position_size(base_size)
 
 
 def check_spread(instrument, pricing):
