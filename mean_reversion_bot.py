@@ -351,7 +351,9 @@ class TradeManager:
             "tp": tp,
             "direction": direction,
             "units": units,
-            "opened_at": datetime.now(timezone.utc)
+            "opened_at": datetime.now(timezone.utc),
+            "breakeven_moved": False,  # Track if SL moved to breakeven
+            "highest_profit_pips": 0.0  # Track highest profit for trailing
         }
     
     def remove_position(self, instrument, exit_price=None, pnl=None):
@@ -694,7 +696,7 @@ def execute_trade(signal):
 
 
 def check_trailing_stops():
-    """Check if any positions should move SL to breakeven or trail."""
+    """Check if any positions should move SL to breakeven (10 pips) or trail (50% of profit)."""
     for instrument, pos in list(trade_mgr.positions.items()):
         try:
             pricing = get_current_price(instrument)
@@ -703,39 +705,51 @@ def check_trailing_stops():
             
             current_price = pricing["bid"] if pos["direction"] == "BUY" else pricing["ask"]
             entry = pos["entry_price"]
-            tp = pos["tp"]
             current_sl = pos["sl"]
             
-            # Calculate profit percentage toward TP
+            # Calculate current profit in pips
             if pos["direction"] == "BUY":
-                total_distance = tp - entry
-                current_profit = current_price - entry
+                profit_pips = (current_price - entry) * 10000  # Convert to pips
             else:
-                total_distance = entry - tp
-                current_profit = entry - current_price
+                profit_pips = (entry - current_price) * 10000
             
-            if total_distance <= 0:
-                continue
+            # Update highest profit seen
+            if profit_pips > pos["highest_profit_pips"]:
+                pos["highest_profit_pips"] = profit_pips
             
-            profit_pct = (current_profit / total_distance) * 100
-            
-            # Move to breakeven at 50% profit
-            if profit_pct >= 50 and current_sl != entry:
-                logger.info(f"{instrument}: Moving SL to breakeven (50% profit reached)")
+            # Step 1: Move to breakeven after 10 pips profit
+            if not pos["breakeven_moved"] and profit_pips >= 10:
+                logger.info(f"{instrument}: Moving SL to breakeven (+10 pips profit reached)")
                 if modify_trade_sl(pos["trade_id"], entry):
                     pos["sl"] = entry
+                    pos["breakeven_moved"] = True
                     if TELEGRAM_ENABLED:
                         notify_sl_stage_change(instrument, "breakeven", entry)
             
-            # Trail to 50% profit at 75% toward TP
-            elif profit_pct >= 75:
-                new_sl = entry + (total_distance * 0.5) if pos["direction"] == "BUY" else entry - (total_distance * 0.5)
-                if abs(new_sl - current_sl) > 0.0001:
-                    logger.info(f"{instrument}: Trailing SL to 50% profit (75% toward TP)")
+            # Step 2: Trail by 50% of profit after breakeven is set
+            elif pos["breakeven_moved"] and profit_pips > 10:
+                # Calculate new SL: entry + 50% of current profit
+                profit_from_entry = profit_pips / 10000  # Convert back to price
+                trailing_distance = profit_from_entry * 0.5
+                
+                if pos["direction"] == "BUY":
+                    new_sl = entry + trailing_distance
+                else:
+                    new_sl = entry - trailing_distance
+                
+                # Only move SL if new SL is better than current
+                should_update = False
+                if pos["direction"] == "BUY" and new_sl > current_sl + 0.0001:
+                    should_update = True
+                elif pos["direction"] == "SELL" and new_sl < current_sl - 0.0001:
+                    should_update = True
+                
+                if should_update:
+                    logger.info(f"{instrument}: Trailing SL to 50% of profit ({profit_pips:.1f} pips)")
                     if modify_trade_sl(pos["trade_id"], new_sl):
                         pos["sl"] = new_sl
                         if TELEGRAM_ENABLED:
-                            notify_sl_stage_change(instrument, "50% profit", new_sl)
+                            notify_sl_stage_change(instrument, f"trailing ({profit_pips:.1f} pips)", new_sl)
         
         except Exception as e:
             logger.error(f"Trailing stop check error for {instrument}: {e}")
