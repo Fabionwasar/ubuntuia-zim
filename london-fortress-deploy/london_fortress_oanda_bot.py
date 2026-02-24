@@ -55,17 +55,17 @@ DAILY_EMA_LEN = 50       # Daily 50 EMA (institutional trend filter)
 H4_ATR_PERIOD = 20       # H4 Supertrend ATR period
 H4_ATR_FACTOR = 3.5      # H4 Supertrend factor
 H4_ADX_LEN = 14          # H4 ADX length
-H4_ADX_THRESHOLD = 20    # Minimum ADX for trending market
+H4_ADX_THRESHOLD = 15    # Minimum ADX for trending market (AGGRESSIVE: lowered from 20)
 FAST_EMA = 9             # H1 fast EMA
 SLOW_EMA = 21            # H1 slow EMA
 RSI_LEN = 14             # H1 RSI length
-RSI_BUY_ZONE = 40        # RSI below this = pullback buy opportunity
-RSI_SELL_ZONE = 60       # RSI above this = pullback sell opportunity
+RSI_BUY_ZONE = 45        # RSI below this = pullback buy opportunity (AGGRESSIVE: raised from 40)
+RSI_SELL_ZONE = 55       # RSI above this = pullback sell opportunity (AGGRESSIVE: lowered from 60)
 
 # London Breakout Settings
 ASIAN_START_HOUR = 0     # Asian session start (UTC)
 ASIAN_END_HOUR = 8       # Asian session end / London open (UTC)
-BREAKOUT_BUFFER_PIPS = 5 # Extra pips beyond Asian range
+BREAKOUT_BUFFER_PIPS = 2 # Extra pips beyond Asian range (AGGRESSIVE: lowered from 5)
 
 # Progressive SL Settings
 BREAKEVEN_PIPS = 10      # Move SL to breakeven + this many pips
@@ -896,7 +896,10 @@ def analyze_market():
     signal = None
     
     # --- BUY SIGNALS ---
-    buy_htf_aligned = daily_bullish and h4_st_bullish and h4_trend_strong
+    # AGGRESSIVE: Allow trades when 2 out of 3 HTF conditions align
+    buy_htf_score = sum([daily_bullish, h4_st_bullish, h4_trend_strong])
+    buy_htf_aligned = buy_htf_score >= 2  # Was: all 3 required, now: 2 of 3
+    buy_htf_full = daily_bullish and h4_st_bullish and h4_trend_strong
     
     # Priority 1: London Breakout (STRONG)
     if buy_htf_aligned and breakout == "LONG_BREAKOUT" and ema_bullish and is_london_session():
@@ -942,21 +945,44 @@ def analyze_market():
             "reason": "EMA 9/21 Cross Up + Daily Bull + H4 ST Bull + ADX Strong"
         }
     
-    # Priority 5: Trend Continuation at session open (LIGHT)
+    # Priority 5: Trend Continuation (LIGHT) — AGGRESSIVE: removed session-open-only restriction
     elif buy_htf_aligned and h1_st_bullish and ema_bullish and current_price > fast_ema_h1[-1]:
-        now = datetime.now(timezone.utc)
-        if now.hour == LONDON_OPEN_HOUR or now.hour == US_OPEN_HOUR:
-            sl = st_h1[-1] - pips_to_price(SL_BUFFER_PIPS) if st_h1[-1] else current_price - pips_to_price(50)
-            sl_dist = abs(current_price - sl)
-            tp = current_price + sl_dist * RISK_REWARD_RATIO
-            signal = {
-                "direction": "BUY", "type": "TREND_CONT", "strength": 1,
-                "entry": current_price, "sl": sl, "tp": tp,
-                "reason": "Trend Continuation at session open + All timeframes aligned"
-            }
+        sl = st_h1[-1] - pips_to_price(SL_BUFFER_PIPS) if st_h1[-1] else current_price - pips_to_price(50)
+        sl_dist = abs(current_price - sl)
+        tp = current_price + sl_dist * RISK_REWARD_RATIO
+        signal = {
+            "direction": "BUY", "type": "TREND_CONT", "strength": 1,
+            "entry": current_price, "sl": sl, "tp": tp,
+            "reason": "Trend Continuation + HTF aligned (" + str(buy_htf_score) + "/3)"
+        }
+    
+    # Priority 6: H1 Supertrend Flip with H4 alignment (LIGHT) — AGGRESSIVE: new signal
+    elif buy_htf_aligned and h1_st_flip_bull and ema_bullish:
+        sl = st_h1[-1] - pips_to_price(SL_BUFFER_PIPS) if st_h1[-1] else current_price - pips_to_price(50)
+        sl_dist = abs(current_price - sl)
+        tp = current_price + sl_dist * RISK_REWARD_RATIO
+        signal = {
+            "direction": "BUY", "type": "H1_ST_FLIP", "strength": 1,
+            "entry": current_price, "sl": sl, "tp": tp,
+            "reason": "H1 Supertrend Flip Bull + HTF aligned (" + str(buy_htf_score) + "/3)"
+        }
+    
+    # Priority 7: Momentum Breakout — price above Asian high + EMA bull (LIGHT) — AGGRESSIVE: new signal
+    elif buy_htf_aligned and asian_range['high'] and current_price > asian_range['high'] and ema_bullish:
+        sl = st_h1[-1] - pips_to_price(SL_BUFFER_PIPS) if st_h1[-1] else current_price - pips_to_price(50)
+        sl_dist = abs(current_price - sl)
+        tp = current_price + sl_dist * RISK_REWARD_RATIO
+        signal = {
+            "direction": "BUY", "type": "MOMENTUM", "strength": 1,
+            "entry": current_price, "sl": sl, "tp": tp,
+            "reason": "Price above Asian High + EMA Bull + HTF aligned (" + str(buy_htf_score) + "/3)"
+        }
     
     # --- SELL SIGNALS ---
-    sell_htf_aligned = daily_bearish and h4_st_bearish and h4_trend_strong
+    # AGGRESSIVE: Allow trades when 2 out of 3 HTF conditions align
+    sell_htf_score = sum([daily_bearish, h4_st_bearish, h4_trend_strong])
+    sell_htf_aligned = sell_htf_score >= 2  # Was: all 3 required, now: 2 of 3
+    sell_htf_full = daily_bearish and h4_st_bearish and h4_trend_strong
     
     if signal is None:
         # Priority 1: London Breakout Short (STRONG)
@@ -1003,18 +1029,38 @@ def analyze_market():
                 "reason": "EMA 9/21 Cross Down + Daily Bear + H4 ST Bear + ADX Strong"
             }
         
-        # Priority 5: Trend Continuation at session open (LIGHT)
+        # Priority 5: Trend Continuation (LIGHT) — AGGRESSIVE: removed session-open-only restriction
         elif sell_htf_aligned and h1_st_bearish and ema_bearish and current_price < fast_ema_h1[-1]:
-            now = datetime.now(timezone.utc)
-            if now.hour == LONDON_OPEN_HOUR or now.hour == US_OPEN_HOUR:
-                sl = st_h1[-1] + pips_to_price(SL_BUFFER_PIPS) if st_h1[-1] else current_price + pips_to_price(50)
-                sl_dist = abs(sl - current_price)
-                tp = current_price - sl_dist * RISK_REWARD_RATIO
-                signal = {
-                    "direction": "SELL", "type": "TREND_CONT", "strength": 1,
-                    "entry": current_price, "sl": sl, "tp": tp,
-                    "reason": "Trend Continuation at session open + All timeframes aligned"
-                }
+            sl = st_h1[-1] + pips_to_price(SL_BUFFER_PIPS) if st_h1[-1] else current_price + pips_to_price(50)
+            sl_dist = abs(sl - current_price)
+            tp = current_price - sl_dist * RISK_REWARD_RATIO
+            signal = {
+                "direction": "SELL", "type": "TREND_CONT", "strength": 1,
+                "entry": current_price, "sl": sl, "tp": tp,
+                "reason": "Trend Continuation + HTF aligned (" + str(sell_htf_score) + "/3)"
+            }
+        
+        # Priority 6: H1 Supertrend Flip with H4 alignment (LIGHT) — AGGRESSIVE: new signal
+        elif sell_htf_aligned and h1_st_flip_bear and ema_bearish:
+            sl = st_h1[-1] + pips_to_price(SL_BUFFER_PIPS) if st_h1[-1] else current_price + pips_to_price(50)
+            sl_dist = abs(sl - current_price)
+            tp = current_price - sl_dist * RISK_REWARD_RATIO
+            signal = {
+                "direction": "SELL", "type": "H1_ST_FLIP", "strength": 1,
+                "entry": current_price, "sl": sl, "tp": tp,
+                "reason": "H1 Supertrend Flip Bear + HTF aligned (" + str(sell_htf_score) + "/3)"
+            }
+        
+        # Priority 7: Momentum Breakdown — price below Asian low + EMA bear (LIGHT) — AGGRESSIVE: new signal
+        elif sell_htf_aligned and asian_range['low'] and current_price < asian_range['low'] and ema_bearish:
+            sl = st_h1[-1] + pips_to_price(SL_BUFFER_PIPS) if st_h1[-1] else current_price + pips_to_price(50)
+            sl_dist = abs(sl - current_price)
+            tp = current_price - sl_dist * RISK_REWARD_RATIO
+            signal = {
+                "direction": "SELL", "type": "MOMENTUM", "strength": 1,
+                "entry": current_price, "sl": sl, "tp": tp,
+                "reason": "Price below Asian Low + EMA Bear + HTF aligned (" + str(sell_htf_score) + "/3)"
+            }
     
     if signal:
         strength_label = {1: "LIGHT", 2: "MODERATE", 3: "STRONG"}
@@ -1184,10 +1230,10 @@ def end_of_day():
 
 
 def hourly_scan():
-    """Periodic scan every hour during trading hours."""
+    """Periodic scan every 30 minutes during trading hours (AGGRESSIVE)."""
     if not is_trading_hours():
         return
-    logger.info("─── HOURLY SCAN ───")
+    logger.info("─── 30-MIN SCAN ───")
     run_market_scan()
 
 
@@ -1446,8 +1492,8 @@ if __name__ == "__main__":
         getattr(schedule.every(), day).at("13:00").do(us_open_scan)
         getattr(schedule.every(), day).at("20:00").do(end_of_day)
     
-    # Hourly scans during trading hours
-    schedule.every(1).hours.do(hourly_scan)
+    # AGGRESSIVE: Scan every 30 minutes instead of hourly
+    schedule.every(30).minutes.do(hourly_scan)
     
     # SL check every 5 minutes
     schedule.every(5).minutes.do(sl_check_loop)
