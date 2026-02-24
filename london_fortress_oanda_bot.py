@@ -41,6 +41,7 @@ from telegram_notifier import (
     notify_bot_stopped,
     TELEGRAM_ENABLED
 )
+from trade_logger import log_trade_opened, log_trade_closed
 
 # ============================================================================
 # CONFIGURATION
@@ -60,7 +61,7 @@ POSITION_SIZE_PER_STACK = 100  # 0.01 lot = 100 units for OANDA
 MAX_STACK_TRADES = 5           # Stack 5 trades per entry signal
 RISK_REWARD_RATIO = 2.5        # 1:2.5 R:R
 
-# Indicator Settings
+# Indicator Settings (defaults — can be overridden by config file)
 DAILY_EMA_LEN = 50       # Daily 50 EMA (institutional trend filter)
 H4_ATR_PERIOD = 20       # H4 Supertrend ATR period
 H4_ATR_FACTOR = 3.5      # H4 Supertrend factor
@@ -76,6 +77,20 @@ RSI_SELL_ZONE = 55       # RSI above this = pullback sell opportunity (AGGRESSIV
 ASIAN_START_HOUR = 0     # Asian session start (UTC)
 ASIAN_END_HOUR = 8       # Asian session end / London open (UTC)
 BREAKOUT_BUFFER_PIPS = 2 # Extra pips beyond Asian range (AGGRESSIVE: lowered from 5)
+
+# Load config overrides from file if it exists
+CONFIG_FILE = "/home/ubuntu/bot_config.json"
+if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config_overrides = json.load(f)
+            H4_ADX_THRESHOLD = config_overrides.get("adx_threshold", H4_ADX_THRESHOLD)
+            RSI_BUY_ZONE = config_overrides.get("rsi_buy_below", RSI_BUY_ZONE)
+            RSI_SELL_ZONE = config_overrides.get("rsi_sell_above", RSI_SELL_ZONE)
+            BREAKOUT_BUFFER_PIPS = config_overrides.get("breakout_buffer_pips", BREAKOUT_BUFFER_PIPS)
+            print(f"[CONFIG] Loaded overrides from {CONFIG_FILE}: {config_overrides}")
+    except Exception as e:
+        print(f"[CONFIG] Error loading config file: {e}")
 
 # Progressive SL Settings
 BREAKEVEN_PIPS = 10      # Move SL to breakeven + this many pips
@@ -319,6 +334,23 @@ def execute_market_order(direction, units, sl_price=None, tp_price=None, comment
             # Record in trade manager
             if trade_id != "N/A":
                 trade_mgr.record_trade(trade_id, direction, float(fill_price), sl_price, tp_price, units)
+                
+                # Log to database
+                try:
+                    db_trade_id = log_trade_opened(
+                        bot="fortress",
+                        pair=INSTRUMENT,
+                        direction=direction,
+                        signal_type=comment if comment else "Manual",
+                        entry_price=float(fill_price),
+                        units=units,
+                        stop_loss=sl_price,
+                        take_profit=tp_price
+                    )
+                    if db_trade_id:
+                        trade_mgr.trades[trade_id]["db_trade_id"] = db_trade_id
+                except Exception as e:
+                    logger.error(f"Database logging failed: {e}")
             
             return {"success": True, "trade_id": trade_id, "fill_price": float(fill_price) if fill_price != "N/A" else 0}
         else:
@@ -407,6 +439,18 @@ def close_trade(trade_id, reason="Manual"):
             direction = trade_mgr.direction if trade_mgr.direction else "UNKNOWN"
             
             logger.info(f"  ✓ TRADE CLOSED: {trade_id} | P/L: {pnl}")
+            
+            # Log to database
+            if trade_id in trade_mgr.trades and "db_trade_id" in trade_mgr.trades[trade_id]:
+                try:
+                    log_trade_closed(
+                        trade_id=trade_mgr.trades[trade_id]["db_trade_id"],
+                        exit_price=exit_price,
+                        pnl=pnl
+                    )
+                except Exception as e:
+                    logger.error(f"Database logging failed: {e}")
+            
             trade_mgr.remove_trade(trade_id, pnl)
             
             # Send Telegram notification
@@ -1376,6 +1420,59 @@ def close_all_endpoint():
     logger.info("MANUAL CLOSE ALL TRIGGERED")
     close_all_trades("Manual close via API")
     return jsonify({"status": "all_positions_closed"}), 200
+
+
+@app.route('/config', methods=['GET'])
+def get_config():
+    """Get current bot configuration."""
+    return jsonify({
+        "adx_threshold": H4_ADX_THRESHOLD,
+        "rsi_buy_below": RSI_BUY_ZONE,
+        "rsi_sell_above": RSI_SELL_ZONE,
+        "breakout_buffer_pips": BREAKOUT_BUFFER_PIPS,
+        "scan_interval_minutes": 30,  # Current aggressive setting
+    }), 200
+
+
+@app.route('/config', methods=['POST'])
+def update_config():
+    """Update bot configuration (requires restart to apply)."""
+    try:
+        data = request.get_json(force=True)
+        config_file = "/home/ubuntu/bot_config.json"
+        
+        # Save config to file
+        with open(config_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        logger.info(f"Configuration updated: {json.dumps(data)}")
+        return jsonify({
+            "status": "saved",
+            "message": "Configuration saved. Restart bot to apply changes.",
+            "config": data
+        }), 200
+    except Exception as e:
+        logger.error(f"Config update error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/restart', methods=['POST'])
+def restart_bot():
+    """Restart the bot service (requires systemd setup)."""
+    try:
+        import subprocess
+        logger.info("Bot restart requested via API")
+        
+        # Restart the systemd service
+        subprocess.Popen(["sudo", "systemctl", "restart", "london-fortress"])
+        
+        return jsonify({
+            "status": "restarting",
+            "message": "Bot restart initiated. Check back in 10 seconds."
+        }), 200
+    except Exception as e:
+        logger.error(f"Restart error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route('/webhook', methods=['POST'])
