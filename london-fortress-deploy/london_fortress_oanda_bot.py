@@ -31,6 +31,16 @@ import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify
+from telegram_notifier import (
+    notify_trade_opened,
+    notify_sl_stage_change,
+    notify_trade_closed,
+    notify_daily_report,
+    notify_error,
+    notify_bot_started,
+    notify_bot_stopped,
+    TELEGRAM_ENABLED
+)
 
 # ============================================================================
 # CONFIGURATION
@@ -50,7 +60,7 @@ POSITION_SIZE_PER_STACK = 100  # 0.01 lot = 100 units for OANDA
 MAX_STACK_TRADES = 5           # Stack 5 trades per entry signal
 RISK_REWARD_RATIO = 2.5        # 1:2.5 R:R
 
-# Indicator Settings
+# Indicator Settings (defaults — can be overridden by config file)
 DAILY_EMA_LEN = 50       # Daily 50 EMA (institutional trend filter)
 H4_ATR_PERIOD = 20       # H4 Supertrend ATR period
 H4_ATR_FACTOR = 3.5      # H4 Supertrend factor
@@ -66,6 +76,20 @@ RSI_SELL_ZONE = 55       # RSI above this = pullback sell opportunity (AGGRESSIV
 ASIAN_START_HOUR = 0     # Asian session start (UTC)
 ASIAN_END_HOUR = 8       # Asian session end / London open (UTC)
 BREAKOUT_BUFFER_PIPS = 2 # Extra pips beyond Asian range (AGGRESSIVE: lowered from 5)
+
+# Load config overrides from file if it exists
+CONFIG_FILE = "/home/ubuntu/bot_config.json"
+if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config_overrides = json.load(f)
+            H4_ADX_THRESHOLD = config_overrides.get("adx_threshold", H4_ADX_THRESHOLD)
+            RSI_BUY_ZONE = config_overrides.get("rsi_buy_below", RSI_BUY_ZONE)
+            RSI_SELL_ZONE = config_overrides.get("rsi_sell_above", RSI_SELL_ZONE)
+            BREAKOUT_BUFFER_PIPS = config_overrides.get("breakout_buffer_pips", BREAKOUT_BUFFER_PIPS)
+            print(f"[CONFIG] Loaded overrides from {CONFIG_FILE}: {config_overrides}")
+    except Exception as e:
+        print(f"[CONFIG] Error loading config file: {e}")
 
 # Progressive SL Settings
 BREAKEVEN_PIPS = 10      # Move SL to breakeven + this many pips
@@ -349,6 +373,16 @@ def execute_stacked_trades(direction, sl_price, tp_price, signal_type="", streng
         time.sleep(0.3)  # Small delay between orders
     
     logger.info(f"  STACK RESULT: {successful}/{trades_to_open} trades opened")
+    
+    # Send Telegram notification
+    if successful > 0 and TELEGRAM_ENABLED:
+        try:
+            account_info = get_account_info()
+            balance = account_info.get("balance", 0.0)
+            notify_trade_opened(direction, entry_price, sl_price, tp_price, successful, balance)
+        except Exception as e:
+            logger.error(f"Failed to send Telegram notification: {e}")
+    
     return successful
 
 
@@ -373,7 +407,7 @@ def modify_trade_sl(trade_id, new_sl):
         return False
 
 
-def close_trade(trade_id):
+def close_trade(trade_id, reason="Manual"):
     """Close a specific trade by ID."""
     try:
         url = f"{OANDA_BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/close"
@@ -381,8 +415,23 @@ def close_trade(trade_id):
         if response.status_code == 200:
             result = response.json()
             pnl = float(result.get("orderFillTransaction", {}).get("pl", 0))
+            fill_tx = result.get("orderFillTransaction", {})
+            entry_price = float(fill_tx.get("tradeOpened", {}).get("price", 0)) if "tradeOpened" in fill_tx else 0
+            exit_price = float(fill_tx.get("price", 0))
+            direction = trade_mgr.direction if trade_mgr.direction else "UNKNOWN"
+            
             logger.info(f"  ✓ TRADE CLOSED: {trade_id} | P/L: {pnl}")
             trade_mgr.remove_trade(trade_id, pnl)
+            
+            # Send Telegram notification
+            if TELEGRAM_ENABLED:
+                try:
+                    account_info = get_account_info()
+                    balance = account_info.get("balance", 0.0)
+                    notify_trade_closed(direction, entry_price or trade_mgr.entry_price, exit_price, pnl, reason, balance)
+                except Exception as e:
+                    logger.error(f"Failed to send Telegram notification: {e}")
+            
             return True
         else:
             logger.error(f"  ✗ Close failed for {trade_id}: {response.status_code}")
@@ -401,7 +450,7 @@ def close_all_trades(reason=""):
     
     logger.info(f"  CLOSING ALL: {len(trades)} trades ({reason})")
     for trade in trades:
-        close_trade(trade["id"])
+        close_trade(trade["id"], reason=reason)
     trade_mgr.reset()
 
 
@@ -769,9 +818,20 @@ def manage_progressive_sl():
                 success_count += 1
         
         if success_count > 0:
+            old_stage_name = trade_mgr.get_sl_stage_name()
             trade_mgr.current_sl = new_sl
             trade_mgr.sl_stage = new_stage
-            logger.info(f"  ✓ SL updated on {success_count}/{len(trades)} trades → Stage: {trade_mgr.get_sl_stage_name()}")
+            new_stage_name = trade_mgr.get_sl_stage_name()
+            logger.info(f"  ✓ SL updated on {success_count}/{len(trades)} trades → Stage: {new_stage_name}")
+            
+            # Send Telegram notification
+            if TELEGRAM_ENABLED:
+                try:
+                    account_info = get_account_info()
+                    unrealized_pl = account_info.get("unrealizedPL", 0.0)
+                    notify_sl_stage_change(old_stage_name, new_stage_name, new_sl, unrealized_pl)
+                except Exception as e:
+                    logger.error(f"Failed to send Telegram notification: {e}")
 
 
 # ============================================================================
@@ -1196,6 +1256,20 @@ def generate_daily_report():
     except Exception as e:
         logger.error(f"  Failed to save report: {e}")
     
+    # Send Telegram daily report
+    if TELEGRAM_ENABLED:
+        try:
+            trades_count = len(trade_mgr.daily_trades)
+            total_pnl = trade_mgr.daily_pnl
+            balance = account.get("balance", 0.0) if account else 0.0
+            win_rate = 0.0
+            if trades_count > 0:
+                wins = sum(1 for t in trade_mgr.daily_trades if t.get("pnl", 0) > 0)
+                win_rate = (wins / trades_count) * 100
+            notify_daily_report(now.strftime('%Y-%m-%d'), trades_count, total_pnl, win_rate, balance)
+        except Exception as e:
+            logger.error(f"Failed to send Telegram daily report: {e}")
+    
     # Reset daily tracking
     trade_mgr.daily_trades = []
     trade_mgr.daily_pnl = 0.0
@@ -1316,6 +1390,59 @@ def close_all_endpoint():
     logger.info("MANUAL CLOSE ALL TRIGGERED")
     close_all_trades("Manual close via API")
     return jsonify({"status": "all_positions_closed"}), 200
+
+
+@app.route('/config', methods=['GET'])
+def get_config():
+    """Get current bot configuration."""
+    return jsonify({
+        "adx_threshold": H4_ADX_THRESHOLD,
+        "rsi_buy_below": RSI_BUY_ZONE,
+        "rsi_sell_above": RSI_SELL_ZONE,
+        "breakout_buffer_pips": BREAKOUT_BUFFER_PIPS,
+        "scan_interval_minutes": 30,  # Current aggressive setting
+    }), 200
+
+
+@app.route('/config', methods=['POST'])
+def update_config():
+    """Update bot configuration (requires restart to apply)."""
+    try:
+        data = request.get_json(force=True)
+        config_file = "/home/ubuntu/bot_config.json"
+        
+        # Save config to file
+        with open(config_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        logger.info(f"Configuration updated: {json.dumps(data)}")
+        return jsonify({
+            "status": "saved",
+            "message": "Configuration saved. Restart bot to apply changes.",
+            "config": data
+        }), 200
+    except Exception as e:
+        logger.error(f"Config update error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/restart', methods=['POST'])
+def restart_bot():
+    """Restart the bot service (requires systemd setup)."""
+    try:
+        import subprocess
+        logger.info("Bot restart requested via API")
+        
+        # Restart the systemd service
+        subprocess.Popen(["sudo", "systemctl", "restart", "london-fortress"])
+        
+        return jsonify({
+            "status": "restarting",
+            "message": "Bot restart initiated. Check back in 10 seconds."
+        }), 200
+    except Exception as e:
+        logger.error(f"Restart error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route('/webhook', methods=['POST'])
@@ -1480,10 +1607,24 @@ if __name__ == "__main__":
     if account:
         logger.info(f"  ✓ OANDA CONNECTED | Balance: {account['balance']:.2f} {account['currency']} | "
                      f"NAV: {account['nav']:.2f} | Open Trades: {account['open_trade_count']}")
+        
+        # Send Telegram bot started notification
+        if TELEGRAM_ENABLED:
+            try:
+                notify_bot_started(account['balance'], OANDA_ENVIRONMENT)
+            except Exception as e:
+                logger.error(f"Failed to send Telegram notification: {e}")
     else:
         logger.error("  ✗ OANDA CONNECTION FAILED — Check API key and account ID")
         logger.error(f"    API Key: {OANDA_API_KEY[:10]}...{OANDA_API_KEY[-10:]}")
         logger.error(f"    Account: {OANDA_ACCOUNT_ID}")
+        
+        # Send error notification
+        if TELEGRAM_ENABLED:
+            try:
+                notify_error("OANDA connection failed at startup")
+            except Exception as e:
+                logger.error(f"Failed to send Telegram notification: {e}")
     
     # Schedule market events
     weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday"]
