@@ -55,6 +55,7 @@ function contentAlreadyExists(dateStr: string): {
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
+  baseURL: process.env.OPENAI_BASE_URL ?? process.env.OPENAI_API_BASE ?? undefined,
 });
 
 async function generate(systemPrompt: string, userPrompt: string): Promise<string> {
